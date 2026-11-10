@@ -16,6 +16,13 @@
      brief: "Launch, fly one full orbit (use time warp), then come back down and land. The whole flight the AI learned.",
      steps: ["Launch to orbit as in mission 3, then press X.", "Press . to speed up time for one lap.", "Press 3 and Z to brake, then land as in mission 2."]},
   ].filter(m => window.GHOSTS && GHOSTS[m.id]).map(m => ({...m, ...GHOSTS[m.id]}));
+  const DAY = Math.floor(Date.now() / 864e5);              // days since 1970; 20767 was 10 Nov 2026
+  if (window.GHOSTS && GHOSTS.daily && GHOSTS.daily.length && MISSIONS.length) {
+    const d = GHOSTS.daily[DAY % GHOSTS.daily.length], high = P.len(d.start.r) - P.R > 2500;
+    MISSIONS.unshift({id: "daily-" + DAY, daily: true, name: "Daily Challenge #" + (DAY - 20766), goal: "land", par: Math.round(d.ai.t * 1.3),
+      brief: (high ? "Today's flight starts high and fast. Brake hard, then land softly." : "Today's flight starts low over the surface. Stop your drift and land softly.") + " A new challenge arrives every day.",
+      steps: MISSIONS[0].steps, ...d});
+  }
 
   let best = {};
   try { best = JSON.parse(localStorage.getItem("moonpilot.best") || "{}"); } catch (e) {}
@@ -27,6 +34,7 @@
     const parts = [["Mission complete", 1000], ["Fuel left (" + Math.round(r.fuel * 100) + "%)", Math.round(1000 * r.fuel)]];
     if (m.goal === "land") parts.push(["Soft touchdown", Math.round(500 * (1 - Math.min(1, r.sev)))]);
     parts.push(["Speed", Math.round(300 * P.clamp(1.5 - r.t / m.par, 0, 1))]);
+    if (r.noCoach) parts.push(["Flown without the coach", Math.round(.15 * parts.reduce((a, p) => a + p[1], 0))]);
     return {total: parts.reduce((a, p) => a + p[1], 0), parts};
   }
   const aiScore = m => score(m, m.ai).total;
@@ -39,7 +47,7 @@
     $("cards").innerHTML = "";
     MISSIONS.forEach((m, i) => {
       const b = document.createElement("button"); b.className = "card";
-      b.innerHTML = `<b>${i + 1}. ${m.name}</b><span>${best[m.id] ? "Your best " + best[m.id] : "Not flown yet"} · ` +
+      b.innerHTML = `<b>${m.daily ? "" : MISSIONS.filter(x => !x.daily).indexOf(m) + 1 + ". "}${m.name}</b><span>${best[m.id] ? "Your best " + best[m.id] : "Not flown yet"} · ` +
         (m.ai.ok ? `<span class="ai">AI ${aiScore(m)}</span>` : `<span class="ai">AI failed this one</span>`) + `</span>`;
       b.onclick = () => brief(i); $("cards").appendChild(b);
     });
@@ -59,7 +67,7 @@
   const ctl = {thr: 0, pitch: 0, yaw: 0, hold: "up", warp: 1}, keys = {}, WARPS = [1, 2, 4, 10, 25, 100];
   function start() {
     const m = MISSIONS[mi];
-    S = P.create(m.start); Q = P.derive(S); gi = 0; endTimer = 0; lastTip = null; legs = m.start.onPad ? 1 : 0; gear = null; fxEvent = null; paused = false; pts = []; lastPt = -1e9;
+    S = P.create(m.start); Q = P.derive(S); gi = 0; endTimer = 0; lastTip = null; coachUsed = false; legs = m.start.onPad ? 1 : 0; gear = null; fxEvent = null; paused = false; pts = []; lastPt = -1e9;
     Object.assign(ctl, {thr: 0, pitch: 0, yaw: 0, warp: 1, hold: m.start.phase === P.DESCENT ? "retro" : "up"});
     World.setMission(m.start, m.rows);
     ["menu", "brief", "result"].forEach(id => show(id, false)); ["hud", "top", "pad"].forEach(id => show(id, true));
@@ -116,11 +124,11 @@
     } else if (state === "ending" && (endTimer -= real) <= 0) return results();
     const g = ghostAt(m, S.t);
     World.update(S, Q, g, {dt: paused ? 0 : real, legs, event: fxEvent}); fxEvent = null;
-    overlay(m, g, paused ? 0 : real); hud(m, g); audio(state === "fly" && !paused ? S.thr : 0);
+    overlay(m, g, paused ? 0 : real); hud(m, g); audio(state === "fly" && !paused ? S.thr : 0); if (state === "fly") warnings();
   }
 
   // ---- flight coach: one plain instruction for the current moment ----
-  let coachOn = true, lastTip = null;
+  let coachOn = true, lastTip = null, coachUsed = false;
   try { coachOn = localStorage.getItem("moonpilot.coach") !== "off"; } catch (e) {}
   const landingSpeed = h => h < 2000 ? Math.max(1.5, h / 10) : .9 * Math.sqrt(5 * h);     // safe speed for a height
   function climbTilt() {                                    // tilt that holds a steady climb to 20 km while building speed
@@ -149,6 +157,7 @@
 
   function hud(m, g) {
     const tip = coachOn && state === "fly" ? advice() : "";
+    if (tip) coachUsed = true;
     if (tip !== lastTip) { $("coach").textContent = lastTip = tip; show("coach", !!tip); }
     const low = S.phase === P.DESCENT && Q.h < 300;
     $("goal").textContent = m.goal === "orbit" || S.phase === P.ASCENT ? "Reach orbit: low point above 10 km"
@@ -241,9 +250,11 @@
   function finish(ok) {
     const m = MISSIONS[mi];
     const progress = m.goal === "orbit" ? P.clamp(Math.abs(Q.vt) / 1650, 0, 1) : 1 - P.clamp(Math.hypot(Q.vr, Q.vh) / 200, 0, 1);
-    outcome = {ok, t: S.t, fuel: Q.fuel, sev: Q.sev, progress, why: S.outcome, vr: Q.vr, vh: Q.vh, tilt: Q.tilt / DEG};
+    outcome = {ok, t: S.t, fuel: Q.fuel, sev: Q.sev, progress, why: S.outcome, vr: Q.vr, vh: Q.vh, tilt: Q.tilt / DEG, noCoach: !coachUsed};
     fxEvent = ok && m.goal === "land" ? "landed" : S.outcome === "crashed" ? "crashed" : null;
-    if (fxEvent === "landed") toast("Touchdown!");
+    if (fxEvent === "landed") { toast("Touchdown!"); burst(.4, .5, 320); beep(70, .3, .2); }
+    else if (fxEvent === "crashed") burst(1.8, .9, 1800);
+    else if (ok) { beep(660, .15); beep(880, .3, .08, "sine", .15); }
     state = "ending"; endTimer = fxEvent ? 2.8 : 1.4; ctl.thr = 0; S.thr = 0;
   }
   function results() {
@@ -260,12 +271,32 @@
       `<tr><td><b>Your score</b></td><td><b>${sc.total}</b></td></tr>` +
       `<tr class="ai"><td>AI score</td><td>${m.ai.ok ? ai : "failed"}</td></tr>` +
       `<tr><td>Result</td><td>${!o.ok ? "Try again" : stars === 3 ? "You beat the AI" : "The AI still leads"}</td></tr>`;
+    shareText = `Moon Pilot - ${m.name}: ${sc.total} ${"★".repeat(stars)}${m.ai.ok ? " (the AI scored " + ai + ")" : ""}. Can you beat it?`;
     if (sc.total > (best[m.id] || 0)) { best[m.id] = sc.total; saveBest(); }
     show("next", mi < MISSIONS.length - 1);
   }
 
   // ---- engine sound, synthesised (no audio files) ----
-  let ac = null, gain = null;
+  let ac = null, gain = null, noise = null, warnAt = 0, shareText = "";
+  function beep(freq, dur, vol = .08, type = "sine", when = 0) {
+    if (!ac) return;
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + when;
+    o.type = type; o.frequency.value = freq; g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur);
+  }
+  function burst(dur, vol, cutoff) {                        // filtered noise: a thud or an explosion
+    if (!ac) return;
+    const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain(), t = ac.currentTime;
+    s.buffer = noise; f.type = "lowpass"; f.frequency.setValueAtTime(cutoff, t); f.frequency.exponentialRampToValueAtTime(60, t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.0001, t + dur);
+    s.connect(f); f.connect(g); g.connect(ac.destination); s.start(t); s.stop(t + dur);
+  }
+  function warnings() {                                     // sink-rate alarm near the ground, and a low-fuel chirp
+    const now = performance.now();
+    if (now < warnAt || paused) return;
+    if (S.phase === P.DESCENT && Q.h < 250 && Q.vr < -Math.max(3, Q.h / 8)) { beep(880, .12, .07, "square"); warnAt = now + 450; }
+    else if (Q.fuel < .08 && Q.fuel > 0) { beep(440, .1, .06); beep(440, .1, .06, "sine", .16); warnAt = now + 2200; }
+  }
   function audio(level) {
     if (!ac) return;
     gain.gain.setTargetAtTime(level * .22, ac.currentTime, .08);
@@ -274,7 +305,7 @@
     if (ac) return;
     try {
       ac = new (window.AudioContext || window.webkitAudioContext)();
-      const buf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = buf.getChannelData(0);
+      const buf = noise = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = buf.getChannelData(0);
       for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
       const src = ac.createBufferSource(), lp = ac.createBiquadFilter(); src.buffer = buf; src.loop = true;
       lp.type = "lowpass"; lp.frequency.value = 420; gain = ac.createGain(); gain.gain.value = 0;
@@ -309,6 +340,11 @@
   $("go").onclick = () => { initAudio(); start(); };
   $("quit").onclick = $("tomenu").onclick = $("back").onclick = menu;
   $("next").onclick = () => brief(mi + 1);
+  $("share").onclick = () => {
+    const url = location.origin + location.pathname, done = () => { $("share").textContent = "Copied"; setTimeout(() => { $("share").textContent = "Share"; }, 1500); };
+    if (navigator.share) navigator.share({title: "Moon Pilot", text: shareText, url}).catch(() => {});
+    else if (navigator.clipboard) navigator.clipboard.writeText(shareText + " " + url).then(done).catch(() => {});
+  };
   menu(); requestAnimationFrame(frame);
   window.MoonPilot = {get state() { return {state, t: S && S.t, h: Q && Q.h, vr: Q && Q.vr, vh: Q && Q.vh, peri: Q && Q.peri, apo: Q && Q.apo, phase: S && S.phase, outcome}; }, get S() { return S; }, get Q() { return Q; }, ctl, keys, tick};   // for testing
 })();
