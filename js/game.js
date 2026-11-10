@@ -180,7 +180,7 @@
   }
 
   // ---- landing legs, AI marker, landing instruments, map ----
-  let legs = 1, gear = null, fxEvent = null, paused = false, mapMode = "2d", pts = [], lastPt = -1e9, frameNo = 0, tel = [], telAt = -1e9, rec = [], recAt = -1e9, sharing = false;
+  let legs = 1, gear = null, fxEvent = null, paused = false, mapMode = "2d", pts = [], lastPt = -1e9, frameNo = 0, tel = [], telAt = -1e9, rec = [], recAt = -1e9, sharing = false, telOn = true;
   try { mapMode = localStorage.getItem("moonpilot.map") || "2d"; } catch (e) {}
   const landC = $("land").getContext("2d"), mapC = $("map2d").getContext("2d");
   function overlay(m, g, real) {
@@ -188,7 +188,7 @@
     if (sharing && flying && S.t - recAt >= (Q.h < 3000 ? 1 : 2)) {   // state and controls, only when the player shares flights
       rec.push([+S.t.toFixed(1), ...S.r.map(x => +x.toFixed(1)), ...S.v.map(x => +x.toFixed(2)), ...S.d.map(x => +x.toFixed(3)), +S.thr.toFixed(2), Math.round(S.m)]); recAt = S.t;
     }
-    if (S.t - telAt >= (Q.h < 3000 ? .5 : 2) || !flying && telAt < S.t) { tel.push([+S.t.toFixed(2), +Q.h.toFixed(1), +Math.hypot(Q.vr, Q.vh).toFixed(2), +Q.vr.toFixed(2), +S.thr.toFixed(2), +Q.fuel.toFixed(4)]); telAt = S.t; }
+    if (telOn && (S.t - telAt >= (Q.h < 3000 ? .5 : 2) || !flying && telAt < S.t)) { tel.push([+S.t.toFixed(2), +Q.h.toFixed(1), +Math.hypot(Q.vr, Q.vh).toFixed(2), +Q.vr.toFixed(2), +S.thr.toFixed(2), +Q.fuel.toFixed(4)]); telAt = S.t; }
     // legs come down on the pad and for landing, fold away in flight (G overrides)
     const want = gear !== null ? gear : (S.onPad || (S.phase === P.DESCENT && Q.h < 1500) || (S.phase === P.ASCENT && Q.h < 60)) ? 1 : 0;
     legs += P.clamp(want - legs, -real / 1.1, real / 1.1);
@@ -347,6 +347,7 @@
     $("cmp").innerHTML = `<tr><th></th><th>You</th><th class="ai">AI</th></tr>` + row("Score", sc.total, m.ai.ok ? ai : "failed") + row("Time", clock(o.t), clock(m.ai.t)) +
       row("Fuel left", Math.round(o.fuel * 100) + "%", Math.round(m.ai.fuel * 100) + "%") +
       (m.goal === "land" ? row("Touchdown speed", Math.abs(o.vr).toFixed(1) + " m/s", Math.abs(last[10]).toFixed(1) + " m/s") + row("Sideways speed", o.vh.toFixed(1) + " m/s", last[11].toFixed(1) + " m/s") : "");
+    ["chart", "savepng", "savejson"].forEach(id => show(id, telOn && tel.length > 1));
     show("cmp", false); $("result").classList.toggle("win", beat);
     if (beat) { $("rtitle").textContent = "You beat the AI!"; celebrate(); }
   }
@@ -428,6 +429,9 @@
   $("boardb").onclick = () => board("overall"); $("rboard").onclick = () => board(MISSIONS[mi].id); $("bclose").onclick = () => show("board", false);
   try { sharing = localStorage.getItem("moonpilot.share") === "yes"; } catch (e) {}
   $("sharef").checked = sharing;
+  try { telOn = localStorage.getItem("moonpilot.tel") !== "off"; } catch (e) {}
+  $("telf").checked = telOn;
+  $("telf").onchange = e => { telOn = e.target.checked; try { localStorage.setItem("moonpilot.tel", telOn ? "on" : "off"); } catch (err) {} };
   $("sharef").onchange = e => { sharing = e.target.checked; try { localStorage.setItem("moonpilot.share", sharing ? "yes" : "no"); } catch (err) {} };
   $("pname").value = pilot;
   $("pname").oninput = e => { pilot = e.target.value.replace(/[<>&"']/g, "").trim().slice(0, 16); try { localStorage.setItem("moonpilot.name", pilot); } catch (err) {} };
