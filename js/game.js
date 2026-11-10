@@ -1,0 +1,314 @@
+// Moon Pilot: menus, missions, flight controls, HUD, scoring and the AI ghost race.
+(() => {
+  const P = Physics, $ = id => document.getElementById(id), DEG = Math.PI / 180;
+  const show = (id, on) => $(id).classList.toggle("hide", !on);
+  const MISSIONS = [
+    {id: "descent", name: "Final Descent", goal: "land", par: 150,
+     brief: "You are over a kilometre up and falling. Kill your speed and touch down: under 3 m/s down, 2 m/s sideways, 15° of tilt.",
+     steps: ["Press 3 so the engine points against your motion.", "Use W and S to hold the speed the coach asks for.", "Touch down slower than 3 m/s."]},
+    {id: "deorbit", name: "Deorbit & Land", goal: "land", par: 1500,
+     brief: "You are in orbit at about 1.6 km/s. Point retrograde, brake, come down and land anywhere.",
+     steps: ["Press 3, then Z for full throttle to brake out of orbit.", "As you fall, follow the coach's target speed with W and S.", "Slow to under 3 m/s for the last 30 metres."]},
+    {id: "launch", name: "Launch to Orbit", goal: "orbit", par: 700,
+     brief: "Lift off, tip over toward prograde and build speed until your orbit's low point is above 10 km and its high point below 100 km.",
+     steps: ["Press Z to lift off.", "Hold D to tip over toward prograde, to the tilt the coach shows.", "Keep burning until the orbit's low point passes 10 km."]},
+    {id: "full", name: "Full Mission", goal: "land", par: 9500,
+     brief: "Launch, fly one full orbit (use time warp), then come back down and land. The whole flight the AI learned.",
+     steps: ["Launch to orbit as in mission 3, then press X.", "Press . to speed up time for one lap.", "Press 3 and Z to brake, then land as in mission 2."]},
+  ].filter(m => window.GHOSTS && GHOSTS[m.id]).map(m => ({...m, ...GHOSTS[m.id]}));
+
+  let best = {};
+  try { best = JSON.parse(localStorage.getItem("moonpilot.best") || "{}"); } catch (e) {}
+  const saveBest = () => { try { localStorage.setItem("moonpilot.best", JSON.stringify(best)); } catch (e) {} };
+
+  // ---- scoring: the same formula for the player and the AI ----
+  function score(m, r) {
+    if (!r.ok) return {total: Math.round(300 * (r.progress || 0)), parts: [["Progress", Math.round(300 * (r.progress || 0))]]};
+    const parts = [["Mission complete", 1000], ["Fuel left (" + Math.round(r.fuel * 100) + "%)", Math.round(1000 * r.fuel)]];
+    if (m.goal === "land") parts.push(["Soft touchdown", Math.round(500 * (1 - Math.min(1, r.sev)))]);
+    parts.push(["Speed", Math.round(300 * P.clamp(1.5 - r.t / m.par, 0, 1))]);
+    return {total: parts.reduce((a, p) => a + p[1], 0), parts};
+  }
+  const aiScore = m => score(m, m.ai).total;
+  const clock = t => { const s = Math.round(t), h = Math.floor(s / 3600), mi = Math.floor(s / 60) % 60; return (h ? h + ":" + String(mi).padStart(2, "0") : mi) + ":" + String(s % 60).padStart(2, "0"); };
+  const dist = h => Math.abs(h) < 2000 ? h.toFixed(0) + " m" : (h / 1000).toFixed(1) + " km";
+
+  // ---- menu ----
+  function menu() {
+    state = "menu"; ["hud", "top", "pad", "brief", "result", "coach", "map", "land", "aimark"].forEach(id => show(id, false)); show("menu", true); audio(0);
+    $("cards").innerHTML = "";
+    MISSIONS.forEach((m, i) => {
+      const b = document.createElement("button"); b.className = "card";
+      b.innerHTML = `<b>${i + 1}. ${m.name}</b><span>${best[m.id] ? "Your best " + best[m.id] : "Not flown yet"} · ` +
+        (m.ai.ok ? `<span class="ai">AI ${aiScore(m)}</span>` : `<span class="ai">AI failed this one</span>`) + `</span>`;
+      b.onclick = () => brief(i); $("cards").appendChild(b);
+    });
+    if (!MISSIONS.length) $("cards").textContent = "No missions found. Run the AI export first.";
+  }
+  function brief(i) {
+    mi = i; const m = MISSIONS[i];
+    show("menu", false); show("result", false); show("brief", true);
+    $("bname").textContent = m.name; $("btext").textContent = m.brief;
+    $("bsteps").innerHTML = m.steps.map(t => `<li>${t}</li>`).join("");
+    $("bai").textContent = m.ai.ok ? `The AI scored ${aiScore(m)} in ${clock(m.ai.t)} with ${Math.round(m.ai.fuel * 100)}% fuel left.`
+                                   : `The AI did not manage this one (${m.ai.text.toLowerCase()}). Can you?`;
+  }
+
+  // ---- flight ----
+  let state = "menu", mi = 0, S = null, Q = null, gi = 0, endTimer = 0, last = performance.now();
+  const ctl = {thr: 0, pitch: 0, yaw: 0, hold: "up", warp: 1}, keys = {}, WARPS = [1, 2, 4, 10, 25, 100];
+  function start() {
+    const m = MISSIONS[mi];
+    S = P.create(m.start); Q = P.derive(S); gi = 0; endTimer = 0; lastTip = null; legs = m.start.onPad ? 1 : 0; gear = null; fxEvent = null; paused = false; pts = []; lastPt = -1e9;
+    Object.assign(ctl, {thr: 0, pitch: 0, yaw: 0, warp: 1, hold: m.start.phase === P.DESCENT ? "retro" : "up"});
+    World.setMission(m.start, m.rows);
+    ["menu", "brief", "result"].forEach(id => show(id, false)); ["hud", "top", "pad"].forEach(id => show(id, true));
+    $("mname").textContent = m.name; state = "fly"; toast(m.goal === "orbit" ? "Throttle up to lift off" : "Good luck");
+  }
+  function toast(text) { const t = $("toast"); t.textContent = text; t.style.opacity = 1; clearTimeout(toast.h); toast.h = setTimeout(() => t.style.opacity = 0, 2600); }
+
+  function command() {                                   // where the player wants the rocket to point
+    if (ctl.hold === "up") return Q.er;
+    if (ctl.hold !== "manual") { const sp = P.len(Q.vrel); return sp < 1 ? Q.er : P.mul(Q.vrel, (ctl.hold === "pro" ? 1 : -1) / sp); }
+    const cp = Math.cos(ctl.pitch), sp = Math.sin(ctl.pitch), cy = Math.cos(ctl.yaw), sy = Math.sin(ctl.yaw);
+    return P.unit(P.add(P.add(P.mul(Q.er, cp * cy), Q.et, sp * cy), Q.ec, sy));
+  }
+  function manual() {                                    // take over from a hold mode without a jump
+    if (ctl.hold === "manual") return;
+    ctl.pitch = Math.atan2(P.dot(S.d, Q.et), P.dot(S.d, Q.er)); ctl.yaw = Math.asin(P.clamp(P.dot(S.d, Q.ec), -1, 1)); ctl.hold = "manual";
+  }
+  function input(dt) {
+    if (keys.w) ctl.thr = Math.min(1, ctl.thr + .7 * dt);
+    if (keys.s) ctl.thr = Math.max(0, ctl.thr - .7 * dt);
+    if (keys.z) ctl.thr = 1;
+    if (keys.x) ctl.thr = 0;
+    if (keys.a || keys.d) { manual(); ctl.pitch += (keys.d ? 1 : -1) * 35 * DEG * dt; }
+    if (keys.q || keys.e) { manual(); ctl.yaw = P.clamp(ctl.yaw + (keys.e ? 1 : -1) * 25 * DEG * dt, -60 * DEG, 60 * DEG); }
+  }
+  function ghostAt(m, t) {
+    const rows = m.rows, end = rows.length - 1;
+    while (gi < end - 1 && rows[gi + 1][0] <= t) gi++;
+    const a = rows[gi], b = rows[Math.min(gi + 1, end)], f = b[0] > a[0] ? P.clamp((t - a[0]) / (b[0] - a[0]), 0, 1) : 0;
+    const mix = k => a[k] + (b[k] - a[k]) * f;
+    return {r: [mix(1), mix(2), mix(3)], d: [mix(4), mix(5), mix(6)], thr: t > rows[end][0] ? 0 : b[7], h: mix(9), i: gi,
+            visible: t <= rows[end][0] + 4, done: t > rows[end][0]};
+  }
+
+  function frame(now) { requestAnimationFrame(frame); tick(now); }
+  function tick(now) {
+    const real = Math.max(0, Math.min(.05, (now - last) / 1000)); last = now;
+    if (state !== "fly" && state !== "ending") return;
+    const m = MISSIONS[mi];
+    if (state === "fly" && !paused) {
+      input(real);
+      const maxWarp = ctl.thr > 0 || Q.h < 3000 ? 4 : 100;        // high warp only while coasting, well above ground
+      if (ctl.warp > maxWarp) ctl.warp = maxWarp;
+      let left = real * ctl.warp;
+      const sub = ctl.thr > 0 || Q.h < 3000 ? .05 * Math.min(ctl.warp, 2) : Math.min(2, .05 * ctl.warp);
+      while (left > 1e-9 && state === "fly") {
+        const dt = Math.min(sub, left); left -= dt;
+        P.step(S, ctl.thr, command(), dt); Q = P.derive(S);
+        const ev = P.rules(S, Q);
+        if (ev === "orbit") { if (m.goal === "orbit") finish(true); else toast("In orbit! Cut the engine and fly one full lap"); }
+        else if (ev === "rev") { ctl.warp = 1; ctl.hold = "retro"; toast("One orbit flown. Now brake and land"); }
+        else if (ev) finish(ev === "landed");
+      }
+    } else if (state === "ending" && (endTimer -= real) <= 0) return results();
+    const g = ghostAt(m, S.t);
+    World.update(S, Q, g, {dt: paused ? 0 : real, legs, event: fxEvent}); fxEvent = null;
+    overlay(m, g, paused ? 0 : real); hud(m, g); audio(state === "fly" && !paused ? S.thr : 0);
+  }
+
+  // ---- flight coach: one plain instruction for the current moment ----
+  let coachOn = true, lastTip = null;
+  try { coachOn = localStorage.getItem("moonpilot.coach") !== "off"; } catch (e) {}
+  const landingSpeed = h => h < 2000 ? Math.max(1.5, h / 10) : .9 * Math.sqrt(5 * h);     // safe speed for a height
+  function climbTilt() {                                    // tilt that holds a steady climb to 20 km while building speed
+    const r = P.R + Math.max(Q.h, 0), geff = P.MU / (r * r) - Q.vt * Q.vt / r, vrT = P.clamp((20000 - Q.h) / 40, -50, 80);
+    return Math.acos(P.clamp((geff + .15 * (vrT - Q.vr)) / (P.THRUST / S.m), 0, 1)) / DEG;
+  }
+  function advice() {
+    const sp = Math.hypot(Q.vr, Q.vh);
+    if (Q.fuel <= 0) return "Out of fuel";
+    if (S.phase === P.ASCENT) {
+      if (S.onPad) return "Press Z (or push the throttle up) to lift off";
+      if (ctl.thr < .95) return "Keep full throttle: press Z";
+      const want = climbTilt(), have = (ctl.hold === "manual" ? ctl.pitch : Math.atan2(P.dot(S.d, Q.et), P.dot(S.d, Q.er))) / DEG;
+      if (Math.abs(want - have) <= 6) return want < 6 ? "Climb straight up" : `Good. Hold about ${want.toFixed(0)}° of tilt until the orbit's low point passes 10 km`;
+      return want > have ? `Tip over toward prograde: hold D to ${want.toFixed(0)}° of tilt (now ${have.toFixed(0)}°)`
+                         : `Too flat: hold A back to ${want.toFixed(0)}° of tilt (now ${have.toFixed(0)}°)`;
+    }
+    if (S.phase === P.COAST) return ctl.thr > 0 ? "You are in orbit: cut the engine with X" : ctl.warp < 25 ? "Coast one lap. Press . to speed up time" : "Coasting. The landing starts after one lap";
+    const target = landingSpeed(Math.max(Q.h, 0)), aim = `${target.toFixed(target < 10 ? 1 : 0)} m/s`;
+    if (ctl.hold !== "retro" && sp > 5) return "Press 3 to point the engine against your motion";
+    if (Q.h < 30) return "Almost down: under 3 m/s and upright";
+    if (sp > target * 1.15) return `Too fast for this height: more throttle (W). Aim for ${aim}`;
+    if (sp < target * .7) return ctl.thr > .02 ? `Slower than you need: ease off (S). Aim for ${aim}` : `Falling is fine. Start braking when your speed reaches ${aim}`;
+    return `On track: hold about ${aim}`;
+  }
+
+  function hud(m, g) {
+    const tip = coachOn && state === "fly" ? advice() : "";
+    if (tip !== lastTip) { $("coach").textContent = lastTip = tip; show("coach", !!tip); }
+    const low = S.phase === P.DESCENT && Q.h < 300;
+    $("goal").textContent = m.goal === "orbit" || S.phase === P.ASCENT ? "Reach orbit: low point above 10 km"
+      : S.phase === P.COAST ? `Coast one lap: ${Math.round(100 * S.theta / P.TAU)}%` : "Land softly";
+    $("t").textContent = clock(S.t); $("h").textContent = dist(Math.max(0, Q.h));
+    $("vr").textContent = (Q.vr > 0 ? "+" : "") + Q.vr.toFixed(1) + " m/s"; $("vr").className = low ? (Q.vr < -3 ? "warn" : "ok") : "";
+    $("vh").textContent = Q.vh.toFixed(Q.vh < 100 ? 1 : 0) + " m/s"; $("vh").className = low ? (Q.vh > 2 ? "warn" : "ok") : "";
+    $("fuel").textContent = Math.round(Q.fuel * 100) + "%"; $("fuel").className = Q.fuel < .1 ? "warn" : "";
+    $("orb").textContent = Q.apo > 1e7 ? "escape" : `${Math.max(Q.apo / 1000, 0).toFixed(0)} / ${Q.peri < 0 ? "ground" : (Q.peri / 1000).toFixed(0) + " km"}`;
+    $("tilt").textContent = (Q.tilt / DEG).toFixed(0) + "°"; $("tilt").className = low ? (Q.tilt > 15 * DEG ? "warn" : "ok") : "";
+    $("aih").textContent = g.done ? (m.ai.ok ? "finished " + clock(m.ai.t) : "failed") : dist(P.len(P.add(g.r, S.r, -1))) + " away";
+    $("thr").value = Math.round(ctl.thr * 100); $("thrv").textContent = Math.round(S.thr * 100) + "%"; $("warp").textContent = ctl.warp + "×";
+    document.querySelectorAll("[data-hold]").forEach(b => b.classList.toggle("on", b.dataset.hold === ctl.hold));
+  }
+
+  // ---- landing legs, AI marker, landing instruments, map ----
+  let legs = 1, gear = null, fxEvent = null, paused = false, mapMode = "2d", pts = [], lastPt = -1e9, frameNo = 0;
+  try { mapMode = localStorage.getItem("moonpilot.map") || "2d"; } catch (e) {}
+  const landC = $("land").getContext("2d"), mapC = $("map2d").getContext("2d");
+  function overlay(m, g, real) {
+    const flying = state === "fly";
+    // legs come down on the pad and for landing, fold away in flight (G overrides)
+    const want = gear !== null ? gear : (S.onPad || (S.phase === P.DESCENT && Q.h < 1500) || (S.phase === P.ASCENT && Q.h < 60)) ? 1 : 0;
+    legs += P.clamp(want - legs, -real / 1.1, real / 1.1);
+
+    // a label on the AI ghost; it slides to the screen edge when the ghost is out of view
+    if (g.visible && flying) {
+      const d = P.len(P.add(g.r, S.r, -1)), sp = World.project(g.r), W = innerWidth, H = innerHeight;
+      let x = sp.front ? sp.x : W - sp.x, y = sp.front ? sp.y : H - sp.y;
+      const off = !sp.front || x < 40 || x > W - 40 || y < 70 || y > H - 70;
+      if (off) { const k = Math.min((W / 2 - 50) / Math.abs(x - W / 2 || 1), (H / 2 - 80) / Math.abs(y - H / 2 || 1)); x = W / 2 + (x - W / 2) * k; y = H / 2 + (y - H / 2) * k; }
+      const am = $("aimark"); am.textContent = (off ? "◆ AI " : "AI ") + dist(d); am.style.left = x + "px"; am.style.top = (y - (off ? 0 : 28)) + "px";
+      show("aimark", d > 15);
+    } else show("aimark", false);
+
+    // landing instruments: down speed against the safe band, height, and sideways drift
+    const landing = flying && S.phase === P.DESCENT && Q.h < 3000; show("land", landing);
+    if (landing) {
+      const c = landC, yv = v => 10 + (5 - P.clamp(v, -25, 5)) * 3, bad = "#ff6b6b", good = "#7fe38b", dim = "#8fa0b8";
+      c.setTransform(2, 0, 0, 2, 0, 0); c.clearRect(0, 0, 220, 110);
+      c.fillStyle = "rgba(12,18,28,.86)"; c.fillRect(0, 0, 220, 110);
+      c.fillStyle = "#1b2536"; c.fillRect(14, 10, 12, 90); c.fillStyle = "#2f8f4e"; c.fillRect(14, yv(0), 12, yv(-3) - yv(0));
+      c.fillStyle = Q.vr < -3 ? bad : good; c.fillRect(8, yv(Q.vr) - 2, 24, 4);
+      c.font = "10px system-ui"; c.fillStyle = dim; c.fillText("DOWN SPEED", 40, 20); c.fillText("HEIGHT", 40, 64);
+      c.font = "600 18px system-ui"; c.fillStyle = Q.vr < -3 ? bad : good; c.fillText(Math.max(0, -Q.vr).toFixed(1) + " m/s", 40, 41);
+      c.fillStyle = "#e6edf7"; c.fillText(dist(Math.max(0, Q.h)), 40, 85);
+      const cx = 172, cy = 48, sc = 3.6, sl = Math.max(Q.vh, 1e-6), kk = Math.min(1, 10 / sl);
+      c.strokeStyle = "#3a4a66"; c.lineWidth = 1; c.beginPath(); c.arc(cx, cy, 36, 0, 7); c.moveTo(cx - 36, cy); c.lineTo(cx + 36, cy); c.moveTo(cx, cy - 36); c.lineTo(cx, cy + 36); c.stroke();
+      c.strokeStyle = "#2f8f4e"; c.lineWidth = 2; c.beginPath(); c.arc(cx, cy, 2 * sc, 0, 7); c.stroke();
+      c.fillStyle = Q.vh > 2 ? bad : good; c.beginPath(); c.arc(cx + Q.vc * kk * sc, cy - Q.vt * kk * sc, 4, 0, 7); c.fill();
+      c.font = "10px system-ui"; c.fillStyle = dim; c.fillText("SIDEWAYS " + Q.vh.toFixed(1) + " m/s", cx - 46, 102);
+    }
+
+    // map: 2D drawing or a 3D view rendered by the world into the same corner
+    const mapOn = mapMode !== "off" && (flying || state === "ending");
+    show("map", mapOn); $("map").classList.toggle("three", mapMode === "3d"); World.map.on = mapOn && mapMode === "3d";
+    if (World.map.on) { const b = $("map").getBoundingClientRect(); World.map.rect = [b.left, b.top, b.width, b.height]; }
+    if (S.t - lastPt > 4) { pts.push(S.r.slice()); lastPt = S.t; if (pts.length > 5000) pts.splice(0, 2); }
+    if (mapOn && mapMode === "2d" && frameNo++ % 4 === 0) drawMap(m, g);
+  }
+  function drawMap(m, g) {                                  // looking down on the flight plane; heights are stretched 10x
+    const c = mapC, EX = 10, k = 92 / (P.R + EX * 120e3), cx = 100, cy = 100;
+    const p0 = P.unit(m.start.r), q0 = P.cross(m.start.nrm, p0);
+    const pr = r => { const x = P.dot(r, p0), y = P.dot(r, q0), rm = Math.hypot(x, y) || 1, rr = (P.R + EX * Math.max(P.len(r) - P.R, 0)) * k; return [cx + x / rm * rr, cy - y / rm * rr]; };
+    const path = (list, color, w) => { c.strokeStyle = color; c.lineWidth = w; c.beginPath(); list.forEach((r, i) => { const [x, y] = pr(r); i ? c.lineTo(x, y) : c.moveTo(x, y); }); c.stroke(); };
+    const dot = (r, color, rad) => { const [x, y] = pr(r); c.fillStyle = color; c.beginPath(); c.arc(x, y, rad, 0, 7); c.fill(); };
+    c.setTransform(2, 0, 0, 2, 0, 0); c.clearRect(0, 0, 200, 200);
+    c.fillStyle = "#2b3242"; c.strokeStyle = "#5a6478"; c.lineWidth = 1; c.beginPath(); c.arc(cx, cy, P.R * k, 0, 7); c.fill(); c.stroke();
+    c.setLineDash([2, 3]); c.strokeStyle = "rgba(127,227,139,.55)"; c.beginPath(); c.arc(cx, cy, (P.R + EX * P.PERI_MIN) * k, 0, 7); c.stroke(); c.setLineDash([]);
+    const hv = P.cross(S.r, S.v), hm = P.len(hv), rm = P.len(S.r);
+    if (hm > 1e6) {                                         // the path you are on if you do nothing
+      const ev = P.add(P.mul(P.cross(S.v, hv), 1 / P.MU), S.r, -1 / rm), e = P.len(ev), sl = hm * hm / P.MU;
+      const a1 = e > 1e-4 ? P.mul(ev, 1 / e) : P.mul(S.r, 1 / rm), a2 = P.unit(P.cross(hv, a1)); let seg = [];
+      for (let i = 0; i <= 120; i++) {
+        const th = i / 120 * P.TAU, r = sl / (1 + e * Math.cos(th));
+        if (r > P.R && r < P.R + 400e3) seg.push(P.add(P.mul(a1, r * Math.cos(th)), a2, r * Math.sin(th)));
+        else { path(seg, "rgba(255,180,84,.5)", 1); seg = []; }
+      }
+      path(seg, "rgba(255,180,84,.5)", 1);
+    }
+    path(m.rows.filter((_, i) => i % 3 === 0 && i <= gi + 3).map(r => [r[1], r[2], r[3]]), "rgba(89,194,255,.75)", 1);
+    path(pts, "#ffb454", 1.6);
+    if (g.visible) dot(g.r, "#59c2ff", 3);
+    dot(S.r, "#ffffff", 3.2);
+    c.fillStyle = "#8fa0b8"; c.font = "9px system-ui"; c.fillText("You: white   AI: blue   height x10", 6, 194);
+  }
+
+  // ---- end of mission ----
+  let outcome = null;
+  function finish(ok) {
+    const m = MISSIONS[mi];
+    const progress = m.goal === "orbit" ? P.clamp(Math.abs(Q.vt) / 1650, 0, 1) : 1 - P.clamp(Math.hypot(Q.vr, Q.vh) / 200, 0, 1);
+    outcome = {ok, t: S.t, fuel: Q.fuel, sev: Q.sev, progress, why: S.outcome, vr: Q.vr, vh: Q.vh, tilt: Q.tilt / DEG};
+    fxEvent = ok && m.goal === "land" ? "landed" : S.outcome === "crashed" ? "crashed" : null;
+    if (fxEvent === "landed") toast("Touchdown!");
+    state = "ending"; endTimer = fxEvent ? 2.8 : 1.4; ctl.thr = 0; S.thr = 0;
+  }
+  function results() {
+    const m = MISSIONS[mi], sc = score(m, outcome), ai = aiScore(m), o = outcome;
+    state = "result"; World.map.on = false; World.update(S, Q, null, {dt: 0, legs, event: null});   // redraw once without the map corner
+    ["hud", "top", "pad", "coach", "map", "land", "aimark"].forEach(id => show(id, false)); show("result", true); audio(0);
+    const stars = !o.ok ? 0 : (!m.ai.ok || sc.total > ai) ? 3 : sc.total >= .9 * ai ? 2 : 1;
+    $("rtitle").textContent = o.ok ? (m.goal === "orbit" ? "Orbit achieved" : "Touchdown!") : o.why === "lost" ? "Lost in space" : "Crashed";
+    $("rstars").textContent = "★".repeat(stars) + "☆".repeat(3 - stars);
+    $("rtext").textContent = m.goal === "land" && o.why !== "lost"
+      ? `Touchdown at ${Math.abs(o.vr).toFixed(1)} m/s down, ${o.vh.toFixed(1)} m/s sideways, ${o.tilt.toFixed(0)}° tilt.` + (o.ok ? "" : " Limits: 3 m/s, 2 m/s, 15°.")
+      : o.ok ? `Orbit reached in ${clock(o.t)}.` : "";
+    $("rtable").innerHTML = sc.parts.map(p => `<tr><td>${p[0]}</td><td>${p[1]}</td></tr>`).join("") +
+      `<tr><td><b>Your score</b></td><td><b>${sc.total}</b></td></tr>` +
+      `<tr class="ai"><td>AI score</td><td>${m.ai.ok ? ai : "failed"}</td></tr>` +
+      `<tr><td>Result</td><td>${!o.ok ? "Try again" : stars === 3 ? "You beat the AI" : "The AI still leads"}</td></tr>`;
+    if (sc.total > (best[m.id] || 0)) { best[m.id] = sc.total; saveBest(); }
+    show("next", mi < MISSIONS.length - 1);
+  }
+
+  // ---- engine sound, synthesised (no audio files) ----
+  let ac = null, gain = null;
+  function audio(level) {
+    if (!ac) return;
+    gain.gain.setTargetAtTime(level * .22, ac.currentTime, .08);
+  }
+  function initAudio() {
+    if (ac) return;
+    try {
+      ac = new (window.AudioContext || window.webkitAudioContext)();
+      const buf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      const src = ac.createBufferSource(), lp = ac.createBiquadFilter(); src.buffer = buf; src.loop = true;
+      lp.type = "lowpass"; lp.frequency.value = 420; gain = ac.createGain(); gain.gain.value = 0;
+      src.connect(lp); lp.connect(gain); gain.connect(ac.destination); src.start();
+    } catch (e) { ac = null; }
+  }
+
+  // ---- wiring ----
+  const setHold = h => { ctl.hold = h; };
+  const warp = dir => { ctl.warp = WARPS[P.clamp(WARPS.indexOf(ctl.warp) + dir, 0, WARPS.length - 1)]; };
+  addEventListener("keydown", e => {
+    const k = e.key.toLowerCase(); keys[k] = true;
+    if (state !== "fly") return;
+    if (k === "1") setHold("up"); if (k === "2") setHold("pro"); if (k === "3") setHold("retro");
+    if (k === ".") warp(1); if (k === ",") warp(-1); if (k === "r") start();
+    if (k === "g") gear = legs > .5 ? 0 : 1; if (k === "m") cycleMap();
+    if (k === "p" || k === "escape") { paused = !paused; toast(paused ? "Paused. Press P to continue" : "Go"); }
+  });
+  addEventListener("keyup", e => { keys[e.key.toLowerCase()] = false; });
+  document.querySelectorAll("[data-key]").forEach(b => {
+    b.onpointerdown = () => { keys[b.dataset.key] = true; }; b.onpointerup = b.onpointerleave = b.onpointercancel = () => { keys[b.dataset.key] = false; };
+  });
+  document.querySelectorAll("[data-hold]").forEach(b => { b.onclick = () => setHold(b.dataset.hold); });
+  $("thr").oninput = e => { ctl.thr = e.target.value / 100; };
+  $("warpup").onclick = () => warp(1); $("warpdn").onclick = () => warp(-1);
+  $("coachb").onclick = () => { coachOn = !coachOn; $("coachb").classList.toggle("on", coachOn); try { localStorage.setItem("moonpilot.coach", coachOn ? "on" : "off"); } catch (e) {} };
+  $("coachb").classList.toggle("on", coachOn);
+  $("camb").onclick = () => { World.cam.mode = World.cam.mode === "follow" ? "whole" : "follow"; };
+  const cycleMap = () => { mapMode = {"2d": "3d", "3d": "off", "off": "2d"}[mapMode]; $("mapb").textContent = "Map " + mapMode.toUpperCase(); try { localStorage.setItem("moonpilot.map", mapMode); } catch (e) {} };
+  $("mapb").onclick = cycleMap; $("mapb").textContent = "Map " + mapMode.toUpperCase();
+  $("restart").onclick = $("retry").onclick = () => start();
+  $("go").onclick = () => { initAudio(); start(); };
+  $("quit").onclick = $("tomenu").onclick = $("back").onclick = menu;
+  $("next").onclick = () => brief(mi + 1);
+  menu(); requestAnimationFrame(frame);
+  window.MoonPilot = {get state() { return {state, t: S && S.t, h: Q && Q.h, vr: Q && Q.vr, vh: Q && Q.vh, peri: Q && Q.peri, apo: Q && Q.apo, phase: S && S.phase, outcome}; }, get S() { return S; }, get Q() { return Q; }, ctl, keys, tick};   // for testing
+})();
